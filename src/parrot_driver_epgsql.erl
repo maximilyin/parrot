@@ -89,7 +89,7 @@ lock(Connection) ->
     exec_sql(Connection, ?LOCK_MIGRATIONS).
 
 unlock(Connection) ->
-    exec_sql(Connection, ?UNLOCK_MIGRATIONS),
+    _ = exec_sql(Connection, ?UNLOCK_MIGRATIONS),
     ok.
 
 begin_tx(Connection) ->

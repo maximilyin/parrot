@@ -188,9 +188,9 @@ apply_migration_in_transaction(Connection, Version, File, Migration, Checksum) -
         ok ->
             case parrot_driver:run_migration(Connection, Migration) of
                 {error, Reason} ->
-                    parrot_driver:rollback(Connection),
+                    _ = parrot_driver:rollback(Connection),
                     error_logger:error_msg("parrot: ~s", [migration_failure_message(Reason)]),
-                    parrot_driver:record_migration(Connection, Version, File, Checksum, false),
+                    _ = parrot_driver:record_migration(Connection, Version, File, Checksum, false),
                     {error, Reason};
                 {ok, Result} ->
                     ok = error_logger:info_msg("Migration was completed with result: ~p", [Result]),
@@ -198,7 +198,7 @@ apply_migration_in_transaction(Connection, Version, File, Migration, Checksum) -
                         ok ->
                             parrot_driver:commit(Connection);
                         {error, Reason} ->
-                            parrot_driver:rollback(Connection),
+                            _ = parrot_driver:rollback(Connection),
                             {error, Reason}
                     end
             end;
@@ -210,7 +210,7 @@ apply_migration_without_transaction(Connection, Version, File, Migration, Checks
     case parrot_driver:run_migration(Connection, Migration) of
         {error, Reason} ->
             error_logger:error_msg("parrot: ~s", [migration_failure_message(Reason)]),
-            parrot_driver:record_migration(Connection, Version, File, Checksum, false),
+            _ = parrot_driver:record_migration(Connection, Version, File, Checksum, false),
             {error, Reason};
         {ok, Result} ->
             ok = error_logger:info_msg("Migration was completed with result: ~p", [Result]),
