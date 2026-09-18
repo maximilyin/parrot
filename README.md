@@ -1,11 +1,12 @@
 # parrot
 
-`parrot` is a PostgreSQL migrations library for Erlang applications.
+`parrot` is a database migrations library for Erlang applications. PostgreSQL, MySQL, MariaDB, and SQLite are supported out of the box through pluggable drivers.
 
 It is designed to run during application startup, before the main supervision tree starts working with the database. If a migration cannot be applied safely, `parrot` crashes the caller so the application does not boot on top of an unexpected schema.
 
 ## Features
 
+- Pluggable database drivers: PostgreSQL (default), MySQL/MariaDB, SQLite, or a custom module implementing the `parrot_driver` behaviour.
 - Automatically creates the `migrations` history table when it is missing.
 - Applies pending `*_upgrade.sql` files in version order.
 - Supports explicit rollback through matching `*_downgrade.sql` files.
@@ -13,9 +14,9 @@ It is designed to run during application startup, before the main supervision tr
 - Validates migration filenames before connecting to the database.
 - Validates checksums of already applied migrations before applying new ones.
 - Logs a human-readable reason when migration startup fails.
-- Uses a PostgreSQL advisory lock to prevent concurrent migration runs.
+- Uses a database-level lock (PostgreSQL advisory lock, MySQL `GET_LOCK`) to prevent concurrent migration runs.
 - Runs each migration in a transaction by default.
-- Supports `-- parrot:no-transaction` for PostgreSQL statements that cannot run inside a transaction.
+- Supports `-- parrot:no-transaction` for statements that cannot run inside a transaction.
 - Provides an `info` API for current version, applied migrations, pending migrations, and missing downgrades.
 
 ## API
@@ -41,10 +42,11 @@ Public functions:
 
 ### Configuration
 
-`Config` is a proplist. Database connection options are passed to `epgsql`, and `migrations_dir` tells `parrot` where SQL files are stored.
+`Config` is a proplist. `driver` selects the database driver, connection options are passed to the underlying client, and `migrations_dir` tells `parrot` where SQL files are stored.
 
 ```erlang
 Config = [
+    {driver, postgres},
     {host, "localhost"},
     {port, 5432},
     {user, "postgres"},
@@ -54,12 +56,41 @@ Config = [
 ].
 ```
 
-If `migrations_dir` is omitted, `parrot` uses `"priv/migrations"`.
+If `driver` is omitted, `parrot` uses `postgres`. If `migrations_dir` is omitted, `parrot` uses `"priv/migrations"`.
 
 The default path is relative to the current working directory of the Erlang process. In releases, pass an explicit path, for example:
 
 ```erlang
 {migrations_dir, filename:join(code:priv_dir(my_app), "migrations")}
+```
+
+### Drivers
+
+| `driver` value | Database | Erlang client used |
+|---|---|---|
+| `postgres` (default) | PostgreSQL | [`epgsql`](https://github.com/epgsql/epgsql) |
+| `mysql` or `mariadb` | MySQL / MariaDB | [`mysql-otp`](https://github.com/mysql-otp/mysql-otp) |
+| `sqlite` | SQLite | [`esqlite`](https://github.com/mmzeeman/esqlite) 0.8.x |
+| any other atom | custom | your module implementing the `parrot_driver` behaviour |
+
+`parrot` declares all three clients (`epgsql` 4.8.0, `mysql` 1.9.0, `esqlite` 0.8.9) as its own dependencies, so host applications get them transitively and do not need to add anything manually. Note that `esqlite` contains a NIF, so building `parrot` requires a C toolchain even if you only use PostgreSQL.
+
+PostgreSQL and MySQL/MariaDB use the same connection options: `host`, `port`, `user`, `password`, `database`.
+
+SQLite only needs the path to the database file:
+
+```erlang
+Config = [
+    {driver, sqlite},
+    {database, "/var/lib/my_app/my_app.db"},
+    {migrations_dir, "priv/migrations"}
+].
+```
+
+To support another database, implement the `parrot_driver` behaviour (connection lifecycle, history table DDL, locking, transaction control, and query execution) and pass the module name in `driver`:
+
+```erlang
+{driver, my_custom_driver}
 ```
 
 ### Apply Migrations
@@ -161,13 +192,11 @@ Only one successful history row is allowed for the same `{version, name}` pair.
 
 ## Locking
 
-Migration and rollback operations use a PostgreSQL advisory lock:
+Migration and rollback operations take a database-level lock so that two application instances cannot apply migrations concurrently:
 
-```sql
-pg_advisory_lock(hashtext('parrot:migrations'))
-```
-
-This prevents two application instances from applying migrations concurrently.
+- PostgreSQL: `pg_advisory_lock(hashtext('parrot:migrations'))`.
+- MySQL / MariaDB: `GET_LOCK('parrot:migrations', ...)`.
+- SQLite: no explicit lock; SQLite serializes writers itself, and the driver sets a busy timeout so concurrent local runs wait instead of failing.
 
 ## Transactions
 
@@ -179,7 +208,7 @@ Use this marker as the first meaningful line when a migration must run outside a
 -- parrot:no-transaction
 ```
 
-This is intended for PostgreSQL operations that cannot run inside `BEGIN` / `COMMIT`, for example `CREATE INDEX CONCURRENTLY`. Non-transactional migrations record history only after successful execution; failed attempts are recorded with `success = false` when possible.
+This is intended for operations that cannot run inside `BEGIN` / `COMMIT`, for example `CREATE INDEX CONCURRENTLY` in PostgreSQL. Note that MySQL DDL statements cause implicit commits, so downgrade files are especially important there. Non-transactional migrations record history only after successful execution; failed attempts are recorded with `success = false` when possible.
 
 ## Downgrade Policy
 
@@ -191,7 +220,7 @@ Rollback is append-only in the history table: a successful downgrade records its
 
 ## History Table
 
-If the `migrations` table does not exist, `parrot` creates it automatically:
+If the `migrations` table does not exist, `parrot` creates it automatically. The exact DDL is driver-specific; for PostgreSQL:
 
 ```sql
 CREATE TABLE migrations (
@@ -204,15 +233,19 @@ CREATE TABLE migrations (
 );
 ```
 
+MySQL/MariaDB uses `INT AUTO_INCREMENT` and `CURRENT_TIMESTAMP`, SQLite uses `INTEGER PRIMARY KEY AUTOINCREMENT`; the columns are the same.
+
 `name` stores the full applied migration filename, for example `001_init_upgrade.sql` or `001_init_downgrade.sql`.
 
-`parrot` also creates a unique partial index for successful history rows:
+On PostgreSQL and SQLite, `parrot` also creates a unique partial index for successful history rows:
 
 ```sql
 CREATE UNIQUE INDEX IF NOT EXISTS migrations_success_name_idx
 ON migrations (version, name)
 WHERE success = TRUE;
 ```
+
+MySQL/MariaDB does not support partial indexes, so this index is not created there; uniqueness of successful rows is still guaranteed in practice because migration runs are serialized by `GET_LOCK`.
 
 If a migration fails, `parrot` records the failed attempt with `success = false`, logs the reason, and crashes with `erlang:error/1`. This prevents the main application from starting on top of a partially migrated schema.
 
@@ -226,15 +259,28 @@ Common startup exceptions:
 
 ## Tests
 
-Run unit tests:
+Run unit tests, fake-driver tests, and the SQLite integration tests (no Docker or database server needed). Checksum mismatch runs on all drivers; the matrix also covers sequential upgrade/rollback and concurrent PostgreSQL/MySQL migrators:
 
 ```sh
 make eunit
 ```
 
-The integration test that creates the `migrations` table and applies a real SQL migration is disabled by default. Enable it with Docker; the test starts an isolated PostgreSQL container, runs the migration, and removes the container during cleanup:
+Run the full integration matrix against real databases. This starts throwaway PostgreSQL and MariaDB containers on a private Docker network (ports are not published to the host, so a local PostgreSQL or MySQL is never used), runs the suite inside an `erlang:27` container on that network, and removes everything afterwards, even on failure:
 
 ```sh
-PARROT_TEST_DOCKER=1 \
-make eunit
+make tests-integration
 ```
+
+Expected `error_logger` lines for `undefined_table`, `checksum_mismatch`, and `enoent` come from negative scenarios; they are not failures by themselves. A real failure is a non-zero `make` exit or an Erlang VM abort.
+
+The PostgreSQL and MySQL/MariaDB integration tests are skipped unless the corresponding `*_HOST` variable is set, so you can also point them at your own databases:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PARROT_TEST_PG_HOST` | unset (tests skipped) | PostgreSQL host |
+| `PARROT_TEST_PG_PORT` | `5432` | PostgreSQL port |
+| `PARROT_TEST_MYSQL_HOST` | unset (tests skipped) | MySQL/MariaDB host |
+| `PARROT_TEST_MYSQL_PORT` | `3306` | MySQL/MariaDB port |
+| `PARROT_TEST_MYSQL_PASSWORD` | `parrot` | MySQL/MariaDB `root` password |
+
+PostgreSQL credentials are `postgres`/`postgres`. Each test scenario creates and drops its own uniquely named database (`parrot_it_*`), so the configured server is left unchanged.

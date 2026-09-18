@@ -1,7 +1,12 @@
 .eunit
 *.o
-*.beam
+ebin
 *.plt
+.agent
+.cursor
+.erlang.mk
+parrot.d
+test/*.beam
 erl_crash.dump
 .concrete/DEV_MODE
 

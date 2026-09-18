@@ -3,77 +3,66 @@
 
 migrate(Config) ->
     Path = migrations_dir(Config),
-    case parrot_validation:validate_config(Config) of
+    case preflight(Config) of
         {error, Reason} ->
             erlang:error({validation_failed, Reason});
-        ok ->
-            case file:list_dir(Path) of
-                {error, Reason} ->
-                    erlang:error({validation_failed, {migrations_dir, Reason}});
-                {ok, Files} ->
-                    case parrot_validation:validate_files(Files) of
-                        {error, Reason} ->
-                            erlang:error({validation_failed, Reason});
-                        {ok, _Warnings} ->
-                            Fun = fun(Connection) ->
-                                parrot_migration:migrate(Connection, Path, Files)
-                            end,
-                            run_or_crash(migration_failed, Config, Fun)
-                    end
-            end
+        {ok, Files, _Warnings} ->
+            Fun = fun(Connection) ->
+                parrot_migration:migrate(Connection, Path, Files)
+            end,
+            run_or_crash(migration_failed, Config, Fun)
     end.
 
 info(Config) ->
-    Path = migrations_dir(Config),
-    case parrot_validation:validate_config(Config) of
+    case preflight(Config) of
         {error, Reason} ->
             {error, Reason};
-        ok ->
-            case file:list_dir(Path) of
+        {ok, Files, FileWarnings} ->
+            case parrot_driver:connect(Config) of
+                {ok, Connection} ->
+                    try parrot_migration:info(Connection, Files, FileWarnings)
+                    after
+                        parrot_driver:close(Connection)
+                    end;
                 {error, Reason} ->
-                    {error, {migrations_dir, Reason}};
-                {ok, Files} ->
-                    case parrot_validation:validate_files(Files) of
-                        {error, Reason} ->
-                            {error, Reason};
-                        {ok, FileWarnings} ->
-                            case parrot_driver:get_connection(Config) of
-                                {ok, Connection} ->
-                                    try parrot_migration:info(Connection, Files, FileWarnings)
-                                    after
-                                        close_connection(Connection)
-                                    end;
-                                {error, Reason} ->
-                                    {error, Reason}
-                            end
-                    end
+                    {error, Reason}
             end
     end.
 
 rollback(Config, TargetVersion) ->
     Path = migrations_dir(Config),
-    case parrot_validation:validate_config(Config) of
+    case preflight(Config) of
         {error, Reason} ->
             erlang:error({validation_failed, Reason});
+        {ok, Files, _Warnings} ->
+            Fun = fun(Connection) ->
+                parrot_migration:rollback(Connection, Path, TargetVersion, Files)
+            end,
+            run_or_crash(rollback_failed, Config, Fun)
+    end.
+
+%% Shared validation before touching the database: config, migrations
+%% directory listing and migration file names.
+preflight(Config) ->
+    case parrot_driver:validate_config(Config) of
+        {error, Reason} ->
+            {error, Reason};
         ok ->
-            case file:list_dir(Path) of
+            case file:list_dir(migrations_dir(Config)) of
                 {error, Reason} ->
-                    erlang:error({validation_failed, {migrations_dir, Reason}});
+                    {error, {migrations_dir, Reason}};
                 {ok, Files} ->
                     case parrot_validation:validate_files(Files) of
+                        {ok, Warnings} ->
+                            {ok, Files, Warnings};
                         {error, Reason} ->
-                            erlang:error({validation_failed, Reason});
-                        {ok, _Warnings} ->
-                            Fun = fun(Connection) ->
-                                parrot_migration:rollback(Connection, Path, TargetVersion, Files)
-                            end,
-                            run_or_crash(rollback_failed, Config, Fun)
+                            {error, Reason}
                     end
             end
     end.
 
 run_or_crash(Tag, Config, Fun) ->
-    case parrot_driver:get_connection(Config) of
+    case parrot_driver:connect(Config) of
         {ok, Connection} ->
             try
                 case Fun(Connection) of
@@ -84,7 +73,7 @@ run_or_crash(Tag, Config, Fun) ->
                         erlang:error({Tag, Reason})
                 end
             after
-                close_connection(Connection)
+                parrot_driver:close(Connection)
             end;
         {error, Reason} ->
             log_failure(Tag, Reason),
@@ -98,17 +87,6 @@ describe_failure({no_migrations_applied, Reason, Path}) ->
     lists:flatten(parrot_validation:describe_reason({no_migrations_applied, Reason, Path}));
 describe_failure(Reason) ->
     lists:flatten(parrot_validation:describe_reason(Reason)).
-
-close_connection(Connection) ->
-    unlink(Connection),
-    catch epgsql:close(Connection),
-    receive
-        {'EXIT', Connection, _Reason} ->
-            ok
-    after 0 ->
-        ok
-    end,
-    ok.
 
 migrations_dir(Config) ->
     proplists:get_value(migrations_dir, Config, "priv/migrations").

@@ -79,108 +79,108 @@ checksum_is_stable_sha256_hex_test() ->
     ?assertEqual(Checksum, parrot_validation:checksum(Sql)),
     ?assertNotEqual(Checksum, parrot_validation:checksum(<<"CREATE TABLE t(id bigint);">>)).
 
-integration_migrate_creates_schema_and_applies_sql_test_() ->
-    case os:getenv("PARROT_TEST_DOCKER") of
-        "1" ->
-            {setup,
-             fun setup_pg_migration/0,
-             fun cleanup_pg_migration/1,
-             fun(State) ->
-                 ?_test(assert_pg_migration(State))
-             end};
-        _ ->
-            []
-    end.
-
-setup_pg_migration() ->
-    PreviousTrapExit = process_flag(trap_exit, true),
-    Container = docker_container_name(),
-    Port = docker_host_port(),
-    try
-        start_postgres_container(Container, Port),
-        Config = pg_config(Port),
-        wait_for_postgres(Container, 30),
-        Path = temp_migrations_dir(),
-        ok = file:make_dir(Path),
-        ok = file:write_file(
-            filename:join(Path, "001_create_widget_upgrade.sql"),
-            <<
-                "CREATE TABLE parrot_test_widget(id integer PRIMARY KEY, name text);\n",
-                "INSERT INTO parrot_test_widget(id, name) VALUES (1, 'created by parrot');\n"
-            >>
-        ),
-        ok = file:write_file(
-            filename:join(Path, "001_create_widget_downgrade.sql"),
-            <<"DROP TABLE parrot_test_widget;\n">>
-        ),
-        TestConfig = [{migrations_dir, Path} | Config],
-        {TestConfig, Path, Container, PreviousTrapExit}
-    catch
-        Class:Reason:Stacktrace ->
-            remove_postgres_container(Container),
-            process_flag(trap_exit, PreviousTrapExit),
-            erlang:raise(Class, Reason, Stacktrace)
-    end.
-
-cleanup_pg_migration({_Config, Path, Container, PreviousTrapExit}) ->
-    file:delete(filename:join(Path, "001_create_widget_upgrade.sql")),
-    file:delete(filename:join(Path, "001_create_widget_downgrade.sql")),
-    file:del_dir(Path),
-    remove_postgres_container(Container),
-    flush_exit_messages(),
-    process_flag(trap_exit, PreviousTrapExit),
-    ok.
-
-assert_pg_migration({Config, _Path, _Container, _PreviousTrapExit}) ->
-    ok = parrot:migrate(Config),
-    {ok, Connection} = parrot_driver:get_connection(Config),
-    try
-        ?assertEqual(1, select_count(Connection, <<"SELECT count(*) FROM migrations">>)),
-        ?assertEqual(
-            1,
-            select_count(
-                Connection,
-                <<"SELECT count(*) FROM migrations ",
-                  "WHERE version = '001' ",
-                  "AND name = '001_create_widget_upgrade.sql' ",
-                  "AND success = TRUE">>
-            )
-        ),
-        ?assertEqual(
-            1,
-            select_count(
-                Connection,
-                <<"SELECT count(*) FROM parrot_test_widget ",
-                  "WHERE id = 1 AND name = 'created by parrot'">>
-            )
+epgsql_normalize_squery_result_test() ->
+    SingleOk = {ok, [], []},
+    ?assertEqual({ok, SingleOk}, parrot_driver_epgsql:normalize_squery_result(SingleOk)),
+    ?assertEqual({error, boom}, parrot_driver_epgsql:normalize_squery_result({error, boom})),
+    OkResults = [{ok, [], []}, {ok, 1}],
+    ?assertEqual({ok, OkResults}, parrot_driver_epgsql:normalize_squery_result(OkResults)),
+    ?assertEqual(
+        {error, first},
+        parrot_driver_epgsql:normalize_squery_result(
+            [{ok, [], []}, {error, first}, {error, second}, {ok, 1}]
         )
+    ).
+
+unknown_driver_is_rejected_by_validate_config_test() ->
+    ?assertEqual(
+        {error, {unknown_driver, bogus}},
+        parrot_driver:validate_config([{driver, bogus}])
+    ).
+
+unknown_driver_crashes_migrate_with_validation_failed_test() ->
+    ?assertError(
+        {validation_failed, {unknown_driver, bogus}},
+        parrot:migrate([{driver, bogus}])
+    ).
+
+fake_driver_failed_run_records_failure_and_raises_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(#{run_migration => boom}, Content, fun(Tab, Config, File) ->
+        ?assertError({migration_failed, File, boom}, parrot:migrate(Config)),
+        Checksum = parrot_validation:checksum(Content),
+        ?assertEqual([{"001", File, Checksum, false}], parrot_fake_driver:history(Tab))
+    end).
+
+fake_driver_transactional_call_order_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(#{}, Content, fun(Tab, Config, File) ->
+        ok = parrot:migrate(Config),
+        Calls = parrot_fake_driver:calls(Tab),
+        ?assertEqual(
+            [begin_tx, run_migration, record_migration, commit],
+            transaction_calls(Calls)
+        ),
+        ?assertEqual(lock, hd(Calls)),
+        ?assertEqual(unlock, lists:last(Calls)),
+        Checksum = parrot_validation:checksum(Content),
+        ?assertEqual([{"001", File, Checksum, true}], parrot_fake_driver:history(Tab))
+    end).
+
+fake_driver_record_failure_rolls_back_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(#{record_migration => boom}, Content, fun(Tab, Config, File) ->
+        ?assertError({migration_failed, File, boom}, parrot:migrate(Config)),
+        ?assertEqual(
+            [begin_tx, run_migration, record_migration, rollback],
+            transaction_calls(parrot_fake_driver:calls(Tab))
+        ),
+        ?assertEqual([], parrot_fake_driver:history(Tab))
+    end).
+
+fake_driver_unlock_called_after_lock_on_failure_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(#{run_migration => boom}, Content, fun(Tab, Config, File) ->
+        ?assertError({migration_failed, File, boom}, parrot:migrate(Config)),
+        Calls = parrot_fake_driver:calls(Tab),
+        ?assertEqual(lock, hd(Calls)),
+        ?assertEqual(unlock, lists:last(Calls))
+    end).
+
+fake_driver_no_transaction_skips_begin_and_commit_test() ->
+    Content = <<"-- parrot:no-transaction\nCREATE INDEX CONCURRENTLY idx ON t(id);">>,
+    with_fake_migrate(#{}, Content, fun(Tab, Config, File) ->
+        ok = parrot:migrate(Config),
+        Calls = parrot_fake_driver:calls(Tab),
+        ?assertNot(lists:member(begin_tx, Calls)),
+        ?assertNot(lists:member(commit, Calls)),
+        ?assert(lists:member(run_migration, Calls)),
+        Checksum = parrot_validation:checksum(Content),
+        ?assertEqual([{"001", File, Checksum, true}], parrot_fake_driver:history(Tab))
+    end).
+
+transaction_calls(Calls) ->
+    [Call || Call <- Calls,
+             lists:member(Call, [begin_tx, run_migration, record_migration, commit, rollback])].
+
+with_fake_migrate(FailMap, MigrationContent, Fun) ->
+    Tab = parrot_fake_driver:new(FailMap),
+    Dir = temp_migrations_dir(),
+    ok = file:make_dir(Dir),
+    File = "001_fake_upgrade.sql",
+    ok = file:write_file(filename:join(Dir, File), MigrationContent),
+    Config = [
+        {driver, parrot_fake_driver},
+        {fake_state, Tab},
+        {migrations_dir, Dir}
+    ],
+    try
+        Fun(Tab, Config, File)
     after
-        close_connection(Connection)
+        file:delete(filename:join(Dir, File)),
+        file:del_dir(Dir),
+        parrot_fake_driver:delete(Tab)
     end.
-
-select_count(Connection, Sql) ->
-    {ok, _, [{Count}]} = epgsql:squery(Connection, Sql),
-    Count.
-
-close_connection(Connection) ->
-    unlink(Connection),
-    catch epgsql:close(Connection),
-    receive
-        {'EXIT', Connection, _Reason} ->
-            ok
-    after 0 ->
-        ok
-    end,
-    ok.
-
-pg_config(Port) ->
-    [
-        {host, "localhost"},
-        {port, Port},
-        {user, "postgres"},
-        {password, "postgres"},
-        {database, "postgres"}
-    ].
 
 getenv(Name, Default) ->
     case os:getenv(Name) of
@@ -195,55 +195,3 @@ temp_migrations_dir() ->
         getenv("TMPDIR", "/tmp"),
         "parrot_migrations_test_" ++ integer_to_list(erlang:unique_integer([positive]))
     ).
-
-docker_container_name() ->
-    "parrot_pg_test_" ++ integer_to_list(erlang:unique_integer([positive])).
-
-docker_host_port() ->
-    20000 + erlang:unique_integer([positive]) rem 20000.
-
-start_postgres_container(Container, Port) ->
-    Command = lists:flatten(io_lib:format(
-        "docker run -d --name ~s "
-        "-e POSTGRES_PASSWORD=postgres "
-        "-e POSTGRES_DB=postgres "
-        "-p 127.0.0.1:~B:5432 "
-        "postgres:16-alpine",
-        [Container, Port]
-    )),
-    Output = string:trim(os:cmd(Command)),
-    case docker_container_running(Container) of
-        true ->
-            ok;
-        false ->
-            erlang:error({docker_start_failed, Output})
-    end.
-
-docker_container_running(Container) ->
-    "true" =:= string:trim(os:cmd("docker inspect -f '{{.State.Running}}' " ++ Container)).
-
-remove_postgres_container(Container) ->
-    os:cmd("docker rm -f " ++ Container),
-    flush_exit_messages(),
-    ok.
-
-flush_exit_messages() ->
-    receive
-        {'EXIT', _Pid, _Reason} ->
-            flush_exit_messages()
-    after 0 ->
-        ok
-    end.
-
-wait_for_postgres(_Container, 0) ->
-    erlang:error(postgres_container_not_ready);
-wait_for_postgres(Container, AttemptsLeft) ->
-    Command = "docker exec " ++ Container ++ " pg_isready -U postgres -d postgres",
-    case string:str(os:cmd(Command), "accepting connections") of
-        0 ->
-            timer:sleep(1000),
-            wait_for_postgres(Container, AttemptsLeft - 1);
-        _ ->
-            timer:sleep(500),
-            ok
-    end.

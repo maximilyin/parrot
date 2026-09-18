@@ -11,6 +11,7 @@
     missing_downgrades/1,
     parse_upgrade_file/1,
     parse_migration_file/1,
+    upgrade_to_downgrade_filename/1,
     version_key_first_three/1,
     upgrade_files_first_three_keys/1
 ]).
