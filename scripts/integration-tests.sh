@@ -8,7 +8,10 @@
 #   network. Ports are not published to the host, so a local PostgreSQL
 #   on :5432 or MySQL on :3306 is never used.
 # - Tests always run inside erlang:27 on that same network, even when
-#   a local `erl` is installed. Host OTP/NIFs do not participate.
+#   a local `erl` is installed. The repository is mounted read-only and
+#   only sources are copied into the container, so host build artifacts
+#   (ebin/, deps/, parrot.d) are neither used nor modified. Beams built
+#   by a different host OTP release cannot be loaded by erlang:27.
 # - Containers, the network and all names are unique per run and
 #   removed on exit, even on failure.
 
@@ -65,11 +68,21 @@ for attempt in $(seq 1 60); do
 done
 
 docker run --rm --network "$NETWORK" \
-    -v "$PWD":/work -w /work -e HOME=/tmp \
+    -v "$PWD":/src:ro -e HOME=/tmp \
     --user "$(id -u):$(id -g)" \
     -e PARROT_TEST_PG_HOST="$PG_CONTAINER" \
     -e PARROT_TEST_PG_PORT=5432 \
     -e PARROT_TEST_MYSQL_HOST="$MYSQL_CONTAINER" \
     -e PARROT_TEST_MYSQL_PORT=3306 \
     -e PARROT_TEST_MYSQL_PASSWORD=parrot \
-    erlang:27 make eunit
+    erlang:27 sh -c '
+        set -e
+        mkdir -p /tmp/parrot
+        tar -C /src \
+            --exclude=./.git --exclude=./ebin --exclude=./deps \
+            --exclude=./.erlang.mk --exclude=./parrot.d \
+            --exclude="*.plt" --exclude=./erl_crash.dump \
+            -cf - . | tar -C /tmp/parrot -xf -
+        cd /tmp/parrot
+        make eunit
+    '

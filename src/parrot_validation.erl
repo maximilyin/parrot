@@ -2,6 +2,7 @@
 
 -export([
     validate_config/1,
+    validate_lock_options/1,
     validate_files/1,
     validate_history/3,
     checksum/1,
@@ -19,6 +20,9 @@
 -define(UPGRADE_FILE_RE, "^([0-9]{3,})_[A-Za-z0-9_-]+_upgrade\\.sql$").
 -define(MIGRATION_FILE_RE, "^([0-9]{3,})_[A-Za-z0-9_-]+_(upgrade|downgrade)\\.sql$").
 -define(VERSION_PREFIX_RE, "^([0-9]{3,})_").
+
+%% PostgreSQL's lock_timeout is a 32-bit millisecond setting.
+-define(MAX_LOCK_TIMEOUT_MS, 2147483647).
 
 validate_config(Config) ->
     StringFields = [host, user, password, database],
@@ -55,6 +59,40 @@ validate_port_field(Config) ->
         _ ->
             {error, {invalid_config_field, port, integer}}
     end.
+
+%% Driver-independent lock options; both are optional.
+validate_lock_options(Config) ->
+    case is_valid_lock_key(proplists:get_value(lock_key, Config)) of
+        false ->
+            {error, {invalid_config_field, lock_key, non_empty_string_or_binary}};
+        true ->
+            case is_valid_lock_timeout(proplists:get_value(lock_timeout, Config)) of
+                false ->
+                    {error, {invalid_config_field, lock_timeout, non_neg_integer_or_infinity}};
+                true ->
+                    ok
+            end
+    end.
+
+is_valid_lock_key(undefined) ->
+    true;
+is_valid_lock_key(Key) ->
+    try unicode:characters_to_binary(Key) of
+        Binary when is_binary(Binary) ->
+            byte_size(Binary) > 0;
+        _Invalid ->
+            false
+    catch
+        error:badarg ->
+            false
+    end.
+
+is_valid_lock_timeout(undefined) ->
+    true;
+is_valid_lock_timeout(infinity) ->
+    true;
+is_valid_lock_timeout(Timeout) ->
+    is_integer(Timeout) andalso Timeout >= 0 andalso Timeout =< ?MAX_LOCK_TIMEOUT_MS.
 
 is_nonempty_stringy(Value) when is_binary(Value) ->
     byte_size(Value) > 0;
@@ -228,6 +266,10 @@ describe_reason({no_migrations_applied, Reason, Path}) ->
         Path,
         ")"
     ]);
+describe_reason({lock_timeout, Key, infinity}) ->
+    io_lib:format("timed out waiting for migration lock ~ts (no timeout configured; server-side wait limit reached)", [Key]);
+describe_reason({lock_timeout, Key, Timeout}) ->
+    io_lib:format("timed out after ~p ms waiting for migration lock ~ts", [Timeout, Key]);
 describe_reason(Reason) ->
     io_lib:format("~p", [Reason]).
 

@@ -71,7 +71,13 @@ scenarios(Spec) ->
     ].
 
 extra_scenarios(Spec) ->
-    [concurrent_migrators_scenario(Spec)].
+    [
+        concurrent_migrators_scenario(Spec),
+        lock_key_isolation_scenario(Spec),
+        lock_timeout_scenario(Spec),
+        lock_wait_then_acquire_scenario(Spec),
+        default_lock_key_scenario(Spec)
+    ].
 
 happy_path_scenario(Spec) ->
     File = "001_widgets_upgrade.sql",
@@ -266,6 +272,131 @@ lock_migration_sql(#{kind := pg}) ->
     <<"SELECT pg_sleep(1);\nCREATE TABLE parrot_it_lock (id INTEGER PRIMARY KEY);\n">>;
 lock_migration_sql(#{kind := mysql}) ->
     <<"SELECT SLEEP(1);\nCREATE TABLE parrot_it_lock (id INTEGER PRIMARY KEY);\n">>.
+
+%% The lock holder is a separate native session, so parrot:migrate/1 run
+%% inside the holder fun genuinely competes for a lock that is held.
+lock_key_isolation_scenario(Spec) ->
+    Files = [{"001_lockopt_upgrade.sql", <<"CREATE TABLE parrot_it_lockopt (id INTEGER PRIMARY KEY);\n">>}],
+    scenario(Spec, "a different lock_key is not blocked by a held lock", Files, fun(Config) ->
+        Key = unique_name("parrot_it_key"),
+        with_lock_holder(Spec, Config, Key, fun() ->
+            ok = parrot:migrate([{lock_key, Key ++ "_b"}, {lock_timeout, 0} | Config]),
+            ?assertEqual(1, count(Spec, Config, successful_history_sql(Spec))),
+            ?assertEqual(1, table_exists(Spec, Config, "parrot_it_lockopt"))
+        end)
+    end).
+
+lock_timeout_scenario(Spec) ->
+    Files = [{"001_lockopt_upgrade.sql", <<"CREATE TABLE parrot_it_lockopt (id INTEGER PRIMARY KEY);\n">>}],
+    scenario(Spec, "lock_timeout fails while the lock is held, then migrates", Files, fun(Config) ->
+        Key = unique_name("parrot_it_key"),
+        BinKey = list_to_binary(Key),
+        with_lock_holder(Spec, Config, Key, fun() ->
+            ?assertError(
+                {migration_failed, {lock_timeout, BinKey, 1000}},
+                parrot:migrate([{lock_key, Key}, {lock_timeout, 1000} | Config])
+            ),
+            ?assertError(
+                {migration_failed, {lock_timeout, BinKey, 0}},
+                parrot:migrate([{lock_key, Key}, {lock_timeout, 0} | Config])
+            ),
+            ?assertEqual(0, table_exists(Spec, Config, "migrations"))
+        end),
+        %% The server releases the holder's lock when its session ends,
+        %% which may lag slightly behind the client closing the socket.
+        ok = parrot:migrate([{lock_key, Key}, {lock_timeout, 10000} | Config]),
+        ?assertEqual(1, count(Spec, Config, successful_history_sql(Spec)))
+    end).
+
+lock_wait_then_acquire_scenario(Spec) ->
+    Files = [{"001_lockwait_upgrade.sql", lock_wait_migration_sql(Spec)}],
+    scenario(Spec, "lock_timeout waits for a held lock, then migrates", Files, fun(Config) ->
+        Key = unique_name("parrot_it_key"),
+        Parent = self(),
+        MigrateConfig = [{lock_key, Key}, {lock_timeout, 10000} | Config],
+        Pid = with_lock_holder(Spec, Config, Key, fun() ->
+            Migrator = spawn_link(fun() -> Parent ! {self(), parrot:migrate(MigrateConfig)} end),
+            try
+                ok = wait_for_lock_waiter(Spec, Config, 10000)
+            catch
+                Class:Reason:Stacktrace ->
+                    exit(Migrator, kill),
+                    erlang:raise(Class, Reason, Stacktrace)
+            end,
+            Migrator
+        end),
+        try
+            ?assertEqual(ok, wait_migrator(Pid, 20000))
+        after
+            exit(Pid, kill)
+        end,
+        ?assertEqual(1, count(Spec, Config, successful_history_sql(Spec))),
+        ?assertEqual(1, table_exists(Spec, Config, "parrot_it_lockwait"))
+    end).
+
+%% The PostgreSQL migration fails if the transaction-local lock_timeout
+%% used while waiting leaked into the migration session.
+lock_wait_migration_sql(#{kind := pg}) ->
+    <<
+        "DO $$ BEGIN IF current_setting('lock_timeout') <> '0' THEN "
+        "RAISE EXCEPTION 'lock_timeout leaked: %', current_setting('lock_timeout'); "
+        "END IF; END $$;\n"
+        "CREATE TABLE parrot_it_lockwait (id INTEGER PRIMARY KEY);\n"
+    >>;
+lock_wait_migration_sql(#{kind := mysql}) ->
+    <<"CREATE TABLE parrot_it_lockwait (id INTEGER PRIMARY KEY);\n">>.
+
+%% Readiness polling: returns once another session of the scenario
+%% database is blocked waiting for a migration lock.
+wait_for_lock_waiter(Spec, Config, Timeout) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    wait_for_lock_waiter(Spec, Config, lock_waiters_sql(Spec), Deadline).
+
+wait_for_lock_waiter(Spec, Config, Sql, Deadline) ->
+    case count(Spec, Config, Sql) >= 1 of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) >= Deadline of
+                true ->
+                    erlang:error(lock_waiter_not_seen);
+                false ->
+                    timer:sleep(50),
+                    wait_for_lock_waiter(Spec, Config, Sql, Deadline)
+            end
+    end.
+
+lock_waiters_sql(#{kind := pg}) ->
+    "SELECT count(*) FROM pg_locks"
+        " WHERE locktype = 'advisory' AND NOT granted"
+        " AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
+lock_waiters_sql(#{kind := mysql}) ->
+    "SELECT count(*) FROM information_schema.processlist"
+        " WHERE state = 'User lock' AND db = DATABASE()".
+
+default_lock_key_scenario(Spec) ->
+    Files = [{"001_lockopt_upgrade.sql", <<"CREATE TABLE parrot_it_lockopt (id INTEGER PRIMARY KEY);\n">>}],
+    scenario(Spec, "default lock_key is parrot:migrations", Files, fun(Config) ->
+        with_lock_holder(Spec, Config, "parrot:migrations", fun() ->
+            ?assertError(
+                {migration_failed, {lock_timeout, <<"parrot:migrations">>, 0}},
+                parrot:migrate([{lock_timeout, 0} | Config])
+            )
+        end)
+    end).
+
+%% PostgreSQL advisory locks are per database, so the holder connects to
+%% the scenario database; MySQL named locks are server-wide.
+with_lock_holder(#{kind := pg} = Spec, Config, Key, Fun) ->
+    with_pg_connection(Spec, proplists:get_value(database, Config), fun(Connection) ->
+        {ok, _Columns, _Rows} = epgsql:squery(Connection, "SELECT pg_advisory_lock(hashtext('" ++ Key ++ "'))"),
+        Fun()
+    end);
+with_lock_holder(#{kind := mysql} = Spec, Config, Key, Fun) ->
+    with_mysql_connection(Spec, proplists:get_value(database, Config), fun(Connection) ->
+        {ok, _Columns, [[1]]} = mysql:query(Connection, "SELECT GET_LOCK('" ++ Key ++ "', 0)"),
+        Fun()
+    end).
 
 wait_migrator(Pid, Timeout) ->
     receive

@@ -10,6 +10,10 @@
 %% The fake records every driver call (in order) under `calls' and every
 %% record_migration row (successful or not) under `history'. Operations
 %% listed in the fail map given to new/1 return {error, Reason}.
+%%
+%% lock/2 and unlock/2 are recorded as `lock' / `unlock' calls like their
+%% /1 variants; the lock options they receive are kept under `lock_opts'
+%% and `unlock_opts'.
 
 -behaviour(parrot_driver).
 
@@ -20,6 +24,8 @@
     ensure_schema/1,
     lock/1,
     unlock/1,
+    lock/2,
+    unlock/2,
     begin_tx/1,
     commit/1,
     rollback/1,
@@ -29,7 +35,7 @@
 ]).
 
 %% Test helpers.
--export([new/0, new/1, delete/1, calls/1, history/1]).
+-export([new/0, new/1, delete/1, calls/1, history/1, lock_opts/1, unlock_opts/1]).
 
 new() ->
     new(#{}).
@@ -39,6 +45,8 @@ new(FailMap) when is_map(FailMap) ->
     ets:insert(Tab, {calls, []}),
     ets:insert(Tab, {history, []}),
     ets:insert(Tab, {fail, FailMap}),
+    ets:insert(Tab, {lock_opts, undefined}),
+    ets:insert(Tab, {unlock_opts, undefined}),
     Tab.
 
 delete(Tab) ->
@@ -52,6 +60,13 @@ calls(Tab) ->
 %% All recorded history rows (including success = false) in insertion order.
 history(Tab) ->
     lists:reverse(lookup(Tab, history)).
+
+%% Options passed to the last lock/2 or unlock/2 call, or undefined.
+lock_opts(Tab) ->
+    lookup(Tab, lock_opts).
+
+unlock_opts(Tab) ->
+    lookup(Tab, unlock_opts).
 
 %% parrot_driver callbacks.
 
@@ -78,6 +93,14 @@ lock(Tab) ->
 unlock(Tab) ->
     record_call(Tab, unlock),
     ok.
+
+lock(Tab, LockOptions) ->
+    ets:insert(Tab, {lock_opts, LockOptions}),
+    lock(Tab).
+
+unlock(Tab, LockOptions) ->
+    ets:insert(Tab, {unlock_opts, LockOptions}),
+    unlock(Tab).
 
 begin_tx(Tab) ->
     op(Tab, begin_tx).

@@ -7,8 +7,9 @@ migrate(Config) ->
         {error, Reason} ->
             erlang:error({validation_failed, Reason});
         {ok, Files, _Warnings} ->
+            LockOptions = parrot_driver:lock_options(Config),
             Fun = fun(Connection) ->
-                parrot_migration:migrate(Connection, Path, Files)
+                parrot_migration:migrate(Connection, Path, Files, LockOptions)
             end,
             run_or_crash(migration_failed, Config, Fun)
     end.
@@ -35,8 +36,9 @@ rollback(Config, TargetVersion) ->
         {error, Reason} ->
             erlang:error({validation_failed, Reason});
         {ok, Files, _Warnings} ->
+            LockOptions = parrot_driver:lock_options(Config),
             Fun = fun(Connection) ->
-                parrot_migration:rollback(Connection, Path, TargetVersion, Files)
+                parrot_migration:rollback(Connection, Path, TargetVersion, Files, LockOptions)
             end,
             run_or_crash(rollback_failed, Config, Fun)
     end.
@@ -81,7 +83,7 @@ run_or_crash(Tag, Config, Fun) ->
     end.
 
 log_failure(Tag, Reason) ->
-    error_logger:error_msg("parrot: ~s failed: ~s", [Tag, describe_failure(Reason)]).
+    error_logger:error_msg("parrot: ~s failed: ~ts", [Tag, describe_failure(Reason)]).
 
 describe_failure({no_migrations_applied, Reason, Path}) ->
     lists:flatten(parrot_validation:describe_reason({no_migrations_applied, Reason, Path}));

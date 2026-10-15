@@ -15,8 +15,10 @@
     connect/1,
     close/1,
     ensure_schema/1,
-    lock/1,
-    unlock/1,
+    lock/2,
+    unlock/2,
+    lock_options/1,
+    log_lock_wait/1,
     begin_tx/1,
     commit/1,
     rollback/1,
@@ -25,12 +27,16 @@
     get_success_history/1
 ]).
 
+-define(DEFAULT_LOCK_KEY, <<"parrot:migrations">>).
+
 -type config() :: [{atom(), term()}].
 -type connection() :: term().
 -type handle() :: {module(), connection()}.
 -type history_row() :: {Version :: string(), Name :: string(), Checksum :: string()}.
+%% `timeout' is in milliseconds; 0 means try once and fail immediately.
+-type lock_options() :: #{key := binary(), timeout := timeout()}.
 
--export_type([config/0, connection/0, handle/0, history_row/0]).
+-export_type([config/0, connection/0, handle/0, history_row/0, lock_options/0]).
 
 %% Connection lifecycle.
 -callback validate_config(config()) -> ok | {error, term()}.
@@ -47,8 +53,19 @@
 
 %% Locking against concurrent migration runs from several nodes.
 %% Drivers without a server-side lock primitive may implement these as no-ops.
+%% lock/2 and unlock/2 receive the configured lock_key and lock_timeout;
+%% they are only used when both are exported. Otherwise the /1 variants
+%% are used and validate_config/1 rejects those options with
+%% {unsupported_config_field, Field, Driver}.
+%% A lock/2 that has to wait for the lock should call log_lock_wait/1
+%% once before blocking, and return {error, {lock_timeout, Key, Timeout}}
+%% when the timeout expires.
 -callback lock(connection()) -> ok | {error, term()}.
 -callback unlock(connection()) -> ok.
+-callback lock(connection(), lock_options()) -> ok | {error, term()}.
+-callback unlock(connection(), lock_options()) -> ok.
+
+-optional_callbacks([lock/2, unlock/2]).
 
 %% Transaction control used for transactional migrations.
 -callback begin_tx(connection()) -> ok | {error, term()}.
@@ -64,10 +81,38 @@
 validate_config(Config) ->
     case driver_module(Config) of
         {ok, Driver} ->
-            Driver:validate_config(Config);
+            case parrot_validation:validate_lock_options(Config) of
+                ok ->
+                    case Driver:validate_config(Config) of
+                        ok ->
+                            validate_lock_support(Driver, Config);
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
+
+%% Expects a config already accepted by validate_config/1.
+-spec lock_options(config()) -> lock_options().
+lock_options(Config) ->
+    Key = unicode:characters_to_binary(proplists:get_value(lock_key, Config, ?DEFAULT_LOCK_KEY)),
+    #{key => Key, timeout => proplists:get_value(lock_timeout, Config, infinity)}.
+
+-spec log_lock_wait(lock_options()) -> ok.
+log_lock_wait(#{key := Key, timeout := Timeout}) ->
+    error_logger:warning_msg(
+        "parrot: waiting for migration lock ~ts (~s); another node may be running migrations",
+        [Key, describe_lock_timeout(Timeout)]
+    ).
+
+describe_lock_timeout(infinity) ->
+    "no timeout";
+describe_lock_timeout(Timeout) ->
+    io_lib:format("timeout: ~p ms", [Timeout]).
 
 -spec connect(config()) -> {ok, handle()} | {error, term()}.
 connect(Config) ->
@@ -91,13 +136,30 @@ close({Driver, Connection}) ->
 ensure_schema({Driver, Connection}) ->
     Driver:ensure_schema(Connection).
 
--spec lock(handle()) -> ok | {error, term()}.
-lock({Driver, Connection}) ->
-    Driver:lock(Connection).
+-spec lock(handle(), lock_options()) -> ok | {error, term()}.
+lock({Driver, Connection}, LockOptions) ->
+    case supports_lock_options(Driver) of
+        true ->
+            Driver:lock(Connection, LockOptions);
+        false ->
+            Driver:lock(Connection)
+    end.
 
--spec unlock(handle()) -> ok.
-unlock({Driver, Connection}) ->
-    Driver:unlock(Connection).
+-spec unlock(handle(), lock_options()) -> ok.
+unlock({Driver, Connection}, LockOptions) ->
+    case supports_lock_options(Driver) of
+        true ->
+            Driver:unlock(Connection, LockOptions);
+        false ->
+            Driver:unlock(Connection)
+    end.
+
+%% lock/2 and unlock/2 are only used as a pair so that a lock is always
+%% released through the same arity that took it. The driver module is
+%% already loaded by validate_config/1 or connect/1, so
+%% erlang:function_exported/3 is reliable here.
+supports_lock_options(Driver) ->
+    erlang:function_exported(Driver, lock, 2) andalso erlang:function_exported(Driver, unlock, 2).
 
 -spec begin_tx(handle()) -> ok | {error, term()}.
 begin_tx({Driver, Connection}) ->
@@ -136,6 +198,21 @@ driver_module(Config) ->
             {ok, parrot_driver_sqlite};
         Module when is_atom(Module) ->
             custom_driver_module(Module)
+    end.
+
+%% Drivers without both lock/2 and unlock/2 cannot honour lock_key /
+%% lock_timeout; reject them instead of silently using the default lock.
+validate_lock_support(Driver, Config) ->
+    case supports_lock_options(Driver) of
+        true ->
+            ok;
+        false ->
+            case [Field || Field <- [lock_key, lock_timeout], proplists:is_defined(Field, Config)] of
+                [] ->
+                    ok;
+                [Field | _] ->
+                    {error, {unsupported_config_field, Field, Driver}}
+            end
     end.
 
 %% A custom driver is any atom besides the built-in names. It must name

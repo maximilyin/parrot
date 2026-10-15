@@ -1,8 +1,15 @@
 -module(parrot_driver_epgsql).
 
 %% PostgreSQL driver backed by the epgsql client.
+%%
+%% The migration lock is a session-level advisory lock on
+%% hashtext(lock_key). Advisory locks are scoped to the current
+%% database, and hashtext/1 is a 32-bit hash: two different keys that
+%% collide only serialize their migration runs, they never corrupt them.
 
 -behaviour(parrot_driver).
+
+-include_lib("epgsql/include/epgsql.hrl").
 
 -export([
     validate_config/1,
@@ -11,6 +18,8 @@
     ensure_schema/1,
     lock/1,
     unlock/1,
+    lock/2,
+    unlock/2,
     begin_tx/1,
     commit/1,
     rollback/1,
@@ -49,9 +58,15 @@
     "SELECT version, name, checksum FROM ", ?TABLE_NAME/binary, " WHERE success = TRUE ORDER BY id ASC"
 >>).
 
--define(LOCK_MIGRATIONS, <<"SELECT pg_advisory_lock(hashtext('parrot:migrations'))">>).
+-define(TRY_LOCK_MIGRATIONS, <<"SELECT pg_try_advisory_lock(hashtext($1))">>).
 
--define(UNLOCK_MIGRATIONS, <<"SELECT pg_advisory_unlock(hashtext('parrot:migrations'))">>).
+-define(LOCK_MIGRATIONS, <<"SELECT pg_advisory_lock(hashtext($1))">>).
+
+-define(UNLOCK_MIGRATIONS, <<"SELECT pg_advisory_unlock(hashtext($1))">>).
+
+-define(SET_LOCAL_LOCK_TIMEOUT, <<"SELECT set_config('lock_timeout', $1, true)">>).
+
+-define(LOCK_NOT_AVAILABLE, <<"55P03">>).
 
 validate_config(Config) ->
     parrot_validation:validate_config(Config).
@@ -86,11 +101,81 @@ ensure_schema(Connection) ->
     end.
 
 lock(Connection) ->
-    exec_sql(Connection, ?LOCK_MIGRATIONS).
+    lock(Connection, parrot_driver:lock_options([])).
 
 unlock(Connection) ->
-    _ = exec_sql(Connection, ?UNLOCK_MIGRATIONS),
+    unlock(Connection, parrot_driver:lock_options([])).
+
+lock(Connection, #{key := Key} = LockOptions) ->
+    case epgsql:equery(Connection, ?TRY_LOCK_MIGRATIONS, [Key]) of
+        {ok, _Columns, [{true}]} ->
+            ok;
+        {ok, _Columns, [{false}]} ->
+            wait_lock(Connection, LockOptions);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+unlock(Connection, #{key := Key}) ->
+    _ = epgsql:equery(Connection, ?UNLOCK_MIGRATIONS, [Key]),
     ok.
+
+%% PostgreSQL treats lock_timeout = 0 as "no timeout", so a zero timeout
+%% is answered from the failed try above and never sent to the server.
+wait_lock(_Connection, #{key := Key, timeout := 0}) ->
+    {error, {lock_timeout, Key, 0}};
+wait_lock(Connection, #{key := Key, timeout := infinity} = LockOptions) ->
+    ok = parrot_driver:log_lock_wait(LockOptions),
+    equery_ok(Connection, ?LOCK_MIGRATIONS, [Key]);
+wait_lock(Connection, LockOptions) ->
+    ok = parrot_driver:log_lock_wait(LockOptions),
+    case exec_sql(Connection, <<"BEGIN">>) of
+        ok ->
+            timed_lock(Connection, LockOptions);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Runs inside BEGIN so the lock_timeout setting is transaction-local.
+%% The advisory lock itself is session-level and survives both COMMIT
+%% and ROLLBACK, so it has to be released explicitly if COMMIT fails.
+timed_lock(Connection, #{key := Key, timeout := Timeout} = LockOptions) ->
+    case set_lock_timeout_and_lock(Connection, Key, Timeout) of
+        ok ->
+            commit_lock(Connection, LockOptions);
+        {error, #error{code = ?LOCK_NOT_AVAILABLE}} ->
+            _ = exec_sql(Connection, <<"ROLLBACK">>),
+            {error, {lock_timeout, Key, Timeout}};
+        {error, Reason} ->
+            _ = exec_sql(Connection, <<"ROLLBACK">>),
+            {error, Reason}
+    end.
+
+set_lock_timeout_and_lock(Connection, Key, Timeout) ->
+    TimeoutSetting = <<(integer_to_binary(Timeout))/binary, "ms">>,
+    case equery_ok(Connection, ?SET_LOCAL_LOCK_TIMEOUT, [TimeoutSetting]) of
+        ok ->
+            equery_ok(Connection, ?LOCK_MIGRATIONS, [Key]);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+commit_lock(Connection, LockOptions) ->
+    case exec_sql(Connection, <<"COMMIT">>) of
+        ok ->
+            ok;
+        {error, Reason} ->
+            ok = unlock(Connection, LockOptions),
+            {error, Reason}
+    end.
+
+equery_ok(Connection, Sql, Params) ->
+    case epgsql:equery(Connection, Sql, Params) of
+        {error, Reason} ->
+            {error, Reason};
+        _Result ->
+            ok
+    end.
 
 begin_tx(Connection) ->
     exec_sql(Connection, <<"BEGIN">>).

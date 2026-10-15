@@ -159,20 +159,84 @@ fake_driver_no_transaction_skips_begin_and_commit_test() ->
         ?assertEqual([{"001", File, Checksum, true}], parrot_fake_driver:history(Tab))
     end).
 
+fake_driver_receives_configured_lock_options_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    LockConfig = [{lock_key, "app_a"}, {lock_timeout, 1000}],
+    with_fake_migrate(parrot_fake_driver, LockConfig, #{}, Content, fun(Tab, Config, _File) ->
+        ok = parrot:migrate(Config),
+        Expected = #{key => <<"app_a">>, timeout => 1000},
+        ?assertEqual(Expected, parrot_fake_driver:lock_opts(Tab)),
+        ?assertEqual(Expected, parrot_fake_driver:unlock_opts(Tab))
+    end).
+
+fake_driver_lock_timeout_raises_without_touching_schema_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    Timeout = {lock_timeout, <<"k">>, 10},
+    with_fake_migrate(#{lock => Timeout}, Content, fun(Tab, Config, _File) ->
+        ?assertError({migration_failed, Timeout}, parrot:migrate(Config)),
+        ?assertEqual([lock], parrot_fake_driver:calls(Tab)),
+        ?assertEqual([], parrot_fake_driver:history(Tab)),
+        ?assertError({rollback_failed, Timeout}, parrot:rollback(Config, "000"))
+    end).
+
+legacy_driver_without_lock_options_still_migrates_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(parrot_fake_legacy_driver, [], #{}, Content, fun(Tab, Config, File) ->
+        ok = parrot:migrate(Config),
+        Calls = parrot_fake_driver:calls(Tab),
+        ?assertEqual(lock, hd(Calls)),
+        ?assertEqual(unlock, lists:last(Calls)),
+        Checksum = parrot_validation:checksum(Content),
+        ?assertEqual([{"001", File, Checksum, true}], parrot_fake_driver:history(Tab))
+    end).
+
+legacy_driver_rejects_lock_options_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(parrot_fake_legacy_driver, [{lock_key, "x"}], #{}, Content, fun(Tab, Config, _File) ->
+        ?assertError(
+            {validation_failed, {unsupported_config_field, lock_key, parrot_fake_legacy_driver}},
+            parrot:migrate(Config)
+        ),
+        ?assertEqual([], parrot_fake_driver:calls(Tab))
+    end).
+
+driver_without_unlock_2_uses_lock_1_and_unlock_1_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(parrot_fake_half_driver, [], #{}, Content, fun(Tab, Config, _File) ->
+        ok = parrot:migrate(Config),
+        Calls = parrot_fake_driver:calls(Tab),
+        ?assertEqual(lock, hd(Calls)),
+        ?assertEqual(unlock, lists:last(Calls)),
+        ?assertEqual(undefined, parrot_fake_driver:lock_opts(Tab))
+    end).
+
+driver_without_unlock_2_rejects_lock_options_test() ->
+    Content = <<"CREATE TABLE t(id integer);">>,
+    with_fake_migrate(parrot_fake_half_driver, [{lock_timeout, 10}], #{}, Content, fun(_Tab, Config, _File) ->
+        ?assertError(
+            {validation_failed, {unsupported_config_field, lock_timeout, parrot_fake_half_driver}},
+            parrot:migrate(Config)
+        )
+    end).
+
 transaction_calls(Calls) ->
     [Call || Call <- Calls,
              lists:member(Call, [begin_tx, run_migration, record_migration, commit, rollback])].
 
 with_fake_migrate(FailMap, MigrationContent, Fun) ->
+    with_fake_migrate(parrot_fake_driver, [], FailMap, MigrationContent, Fun).
+
+with_fake_migrate(Driver, ExtraConfig, FailMap, MigrationContent, Fun) ->
     Tab = parrot_fake_driver:new(FailMap),
     Dir = temp_migrations_dir(),
     ok = file:make_dir(Dir),
     File = "001_fake_upgrade.sql",
     ok = file:write_file(filename:join(Dir, File), MigrationContent),
     Config = [
-        {driver, parrot_fake_driver},
+        {driver, Driver},
         {fake_state, Tab},
         {migrations_dir, Dir}
+        | ExtraConfig
     ],
     try
         Fun(Tab, Config, File)

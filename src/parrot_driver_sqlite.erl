@@ -5,10 +5,11 @@
 %% Differences from the server-based drivers:
 %% - The only required connection option is `database', the path to the
 %%   database file.
-%% - lock/1 and unlock/1 are no-ops: SQLite serializes writers itself and
-%%   there is no server to share an advisory lock through. A busy timeout
-%%   is set on the connection so concurrent local runs wait instead of
-%%   failing immediately.
+%% - lock/1,2 and unlock/1,2 are no-ops: SQLite serializes writers itself
+%%   and there is no server to share an advisory lock through. A busy
+%%   timeout is set on the connection so concurrent local runs wait
+%%   instead of failing immediately. lock_key and lock_timeout are
+%%   validated like for every driver but otherwise ignored.
 
 -behaviour(parrot_driver).
 
@@ -19,6 +20,8 @@
     ensure_schema/1,
     lock/1,
     unlock/1,
+    lock/2,
+    unlock/2,
     begin_tx/1,
     commit/1,
     rollback/1,
@@ -97,6 +100,12 @@ lock(_Connection) ->
     ok.
 
 unlock(_Connection) ->
+    ok.
+
+lock(_Connection, _LockOptions) ->
+    ok.
+
+unlock(_Connection, _LockOptions) ->
     ok.
 
 begin_tx(Connection) ->

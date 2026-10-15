@@ -58,6 +58,11 @@ Config = [
 
 If `driver` is omitted, `parrot` uses `postgres`. If `migrations_dir` is omitted, `parrot` uses `"priv/migrations"`.
 
+Two optional settings control the migration lock (see [Locking](#locking)):
+
+- `{lock_key, Key}`: non-empty string or binary naming the lock. Default `"parrot:migrations"`. Use different keys for applications that share a database server but must not serialize each other's migrations.
+- `{lock_timeout, Ms}`: how long to wait for the lock, as an integer of milliseconds from `0` to `2147483647` (about 24.8 days, PostgreSQL's limit for `lock_timeout`), or `infinity`. Default `infinity`. `0` tries once and fails immediately if the lock is held.
+
 The default path is relative to the current working directory of the Erlang process. In releases, pass an explicit path, for example:
 
 ```erlang
@@ -92,6 +97,8 @@ To support another database, implement the `parrot_driver` behaviour (connection
 ```erlang
 {driver, my_custom_driver}
 ```
+
+To support `lock_key` and `lock_timeout`, a custom driver implements the optional `lock/2` and `unlock/2` callbacks, which receive `#{key := binary(), timeout := timeout()}`. Drivers that only implement `lock/1` and `unlock/1` keep working with the default lock, but a config that sets `lock_key` or `lock_timeout` is rejected with `{validation_failed, {unsupported_config_field, Field, Driver}}`.
 
 ### Apply Migrations
 
@@ -194,9 +201,11 @@ Only one successful history row is allowed for the same `{version, name}` pair.
 
 Migration and rollback operations take a database-level lock so that two application instances cannot apply migrations concurrently:
 
-- PostgreSQL: `pg_advisory_lock(hashtext('parrot:migrations'))`.
-- MySQL / MariaDB: `GET_LOCK('parrot:migrations', ...)`.
-- SQLite: no explicit lock; SQLite serializes writers itself, and the driver sets a busy timeout so concurrent local runs wait instead of failing.
+- PostgreSQL: session-level `pg_advisory_lock(hashtext(LockKey))`. Advisory locks are scoped to the database, so runs against different databases never block each other. `hashtext` is a 32-bit hash; two different keys that collide only serialize their migration runs.
+- MySQL / MariaDB: `GET_LOCK(LockKey, ...)`. Named locks are server-wide, across all databases. `lock_key` is limited to 64 characters, and `lock_timeout` is rounded up to whole seconds. With `infinity` the server waits up to one day.
+- SQLite: no explicit lock; SQLite serializes writers itself, and the driver sets a busy timeout so concurrent local runs wait instead of failing. `lock_key` and `lock_timeout` are validated but ignored.
+
+`LockKey` is the configured `lock_key`, `"parrot:migrations"` by default. If the lock is held by another session, `parrot` logs one warning (`parrot: waiting for migration lock ...`) and then waits up to `lock_timeout`. With `lock_timeout` set to `0` it fails right away without logging that warning. When the timeout expires nothing is executed and `parrot:migrate/1` raises `{migration_failed, {lock_timeout, Key, Ms}}` (`{rollback_failed, ...}` for `parrot:rollback/2`), with `Key` as a binary. `Ms` is `infinity` only when MySQL's one-day wait limit is reached.
 
 ## Transactions
 

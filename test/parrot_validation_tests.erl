@@ -109,6 +109,100 @@ describe_reason_includes_path_for_empty_directory_test() ->
     ?assertEqual(true, string:find(Message, "priv/migrations") =/= nomatch),
     ?assertEqual(true, string:find(Message, "no .sql files") =/= nomatch).
 
+invalid_lock_timeout_is_rejected_test() ->
+    lists:foreach(
+        fun(Timeout) ->
+            ?assertEqual(
+                {error, {invalid_config_field, lock_timeout, non_neg_integer_or_infinity}},
+                parrot_driver:validate_config(fake_config([{lock_timeout, Timeout}]))
+            )
+        end,
+        [-1, 1.5, "10", foo, 2147483648]
+    ).
+
+valid_lock_timeout_is_accepted_test() ->
+    lists:foreach(
+        fun(Timeout) ->
+            ?assertEqual(ok, parrot_driver:validate_config(fake_config([{lock_timeout, Timeout}])))
+        end,
+        [0, 5000, 2147483647, infinity]
+    ).
+
+invalid_lock_key_is_rejected_test() ->
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual(
+                {error, {invalid_config_field, lock_key, non_empty_string_or_binary}},
+                parrot_driver:validate_config(fake_config([{lock_key, Key}]))
+            )
+        end,
+        ["", <<>>, 42, [foo], <<255>>]
+    ).
+
+valid_lock_key_is_accepted_test() ->
+    lists:foreach(
+        fun(Key) ->
+            ?assertEqual(ok, parrot_driver:validate_config(fake_config([{lock_key, Key}])))
+        end,
+        ["app_a", <<"app_a">>, "схема"]
+    ).
+
+mysql_lock_key_longer_than_64_characters_is_rejected_test() ->
+    ?assertEqual(
+        {error, {invalid_config_field, lock_key, max_64_characters}},
+        parrot_driver_mysql:validate_config(mysql_config([{lock_key, lists:duplicate(65, $a)}]))
+    ),
+    ?assertEqual(
+        ok,
+        parrot_driver_mysql:validate_config(mysql_config([{lock_key, lists:duplicate(64, $a)}]))
+    ).
+
+mysql_lock_key_length_counts_code_points_test() ->
+    %% "e" + combining acute accent: one grapheme, two code points.
+    Accented = [$e, 16#301],
+    ?assertEqual(
+        {error, {invalid_config_field, lock_key, max_64_characters}},
+        parrot_driver_mysql:validate_config(mysql_config([{lock_key, lists:append(lists:duplicate(33, Accented))}]))
+    ),
+    ?assertEqual(
+        ok,
+        parrot_driver_mysql:validate_config(mysql_config([{lock_key, lists:append(lists:duplicate(32, Accented))}]))
+    ).
+
+sqlite_validates_lock_options_test() ->
+    ?assertEqual(
+        {error, {invalid_config_field, lock_timeout, non_neg_integer_or_infinity}},
+        parrot_driver:validate_config([{driver, sqlite}, {database, "x.db"}, {lock_timeout, -1}])
+    ).
+
+lock_options_defaults_test() ->
+    ?assertEqual(
+        #{key => <<"parrot:migrations">>, timeout => infinity},
+        parrot_driver:lock_options([])
+    ).
+
+lock_options_from_config_test() ->
+    ?assertEqual(
+        #{key => <<"a">>, timeout => 10},
+        parrot_driver:lock_options([{lock_key, "a"}, {lock_timeout, 10}])
+    ).
+
+describe_reason_explains_lock_timeout_test() ->
+    Message = lists:flatten(parrot_validation:describe_reason({lock_timeout, <<"k">>, 10})),
+    ?assertEqual(true, string:find(Message, "10 ms") =/= nomatch),
+    ?assertEqual(true, string:find(Message, "k") =/= nomatch).
+
+describe_reason_explains_lock_timeout_without_configured_timeout_test() ->
+    Message = lists:flatten(parrot_validation:describe_reason({lock_timeout, <<"k">>, infinity})),
+    ?assertEqual(nomatch, string:find(Message, "infinity")),
+    ?assertEqual(true, string:find(Message, "no timeout configured") =/= nomatch).
+
+fake_config(Extra) ->
+    [{driver, parrot_fake_driver} | Extra].
+
+mysql_config(Extra) ->
+    [{host, "localhost"}, {port, 3306}, {user, "u"}, {password, "p"}, {database, "d"} | Extra].
+
 describe_reason_explains_invalid_suffix_test() ->
     Message = lists:flatten(
         parrot_validation:describe_reason(

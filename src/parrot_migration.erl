@@ -1,5 +1,5 @@
 -module(parrot_migration).
--export([migrate/3, info/3, rollback/4]).
+-export([migrate/4, info/3, rollback/5]).
 
 -ifdef(TEST).
 -export([current_applied_from_history/1, downgrade_file/1, no_transaction/1]).
@@ -8,8 +8,8 @@
 %% Connection is a parrot_driver:handle(); all database access goes
 %% through the parrot_driver dispatch module.
 
-migrate(Connection, Path, Files) ->
-    with_lock(Connection, fun() ->
+migrate(Connection, Path, Files, LockOptions) ->
+    with_lock(Connection, LockOptions, fun() ->
         case parrot_driver:ensure_schema(Connection) of
             ok ->
                 validate_and_apply_migrations(Connection, Path, Files);
@@ -26,8 +26,8 @@ info(Connection, Files, FileWarnings) ->
             {error, Reason}
     end.
 
-rollback(Connection, Path, TargetVersion, Files) ->
-    with_lock(Connection, fun() ->
+rollback(Connection, Path, TargetVersion, Files, LockOptions) ->
+    with_lock(Connection, LockOptions, fun() ->
         case parrot_driver:ensure_schema(Connection) of
             ok ->
                 rollback_migrations(Connection, Path, normalize_version(TargetVersion), Files);
@@ -225,12 +225,12 @@ no_transaction(Migration) ->
             false
     end.
 
-with_lock(Connection, Fun) ->
-    case parrot_driver:lock(Connection) of
+with_lock(Connection, LockOptions, Fun) ->
+    case parrot_driver:lock(Connection, LockOptions) of
         ok ->
             try Fun()
             after
-                parrot_driver:unlock(Connection)
+                parrot_driver:unlock(Connection, LockOptions)
             end;
         {error, Reason} ->
             {error, Reason}

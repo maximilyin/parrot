@@ -4,6 +4,9 @@
 %%
 %% Differences from the PostgreSQL driver:
 %% - Locking uses GET_LOCK / RELEASE_LOCK instead of advisory locks.
+%%   Named locks are server-wide (not per database), lock_key is limited
+%%   to 64 characters, and GET_LOCK only accepts whole seconds, so
+%%   lock_timeout is rounded up to the next second.
 %% - MySQL does not support partial indexes, so the unique index on
 %%   successful history rows is not created. Uniqueness is still
 %%   guaranteed in practice because migration runs are serialized by
@@ -18,6 +21,8 @@
     ensure_schema/1,
     lock/1,
     unlock/1,
+    lock/2,
+    unlock/2,
     begin_tx/1,
     commit/1,
     rollback/1,
@@ -47,12 +52,34 @@
 
 %% One day, effectively "wait forever" while staying compatible with
 %% both MySQL and MariaDB timeout semantics.
--define(LOCK_TIMEOUT_SECONDS, 86400).
+-define(INFINITE_LOCK_TIMEOUT_SECONDS, 86400).
 
--define(UNLOCK_MIGRATIONS, <<"SELECT RELEASE_LOCK('parrot:migrations')">>).
+-define(MAX_LOCK_KEY_LENGTH, 64).
+
+-define(LOCK_MIGRATIONS, <<"SELECT GET_LOCK(?, ?)">>).
+
+-define(UNLOCK_MIGRATIONS, <<"SELECT RELEASE_LOCK(?)">>).
 
 validate_config(Config) ->
-    parrot_validation:validate_config(Config).
+    case parrot_validation:validate_config(Config) of
+        ok ->
+            validate_lock_key_length(Config);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+validate_lock_key_length(Config) ->
+    case proplists:get_value(lock_key, Config) of
+        undefined ->
+            ok;
+        Key ->
+            case length(unicode:characters_to_list(Key)) > ?MAX_LOCK_KEY_LENGTH of
+                true ->
+                    {error, {invalid_config_field, lock_key, max_64_characters}};
+                false ->
+                    ok
+            end
+    end.
 
 connect(Config) ->
     Options = [
@@ -89,20 +116,47 @@ ensure_schema(Connection) ->
     exec_sql(Connection, ?CREATE_MIGRATIONS_TABLE).
 
 lock(Connection) ->
-    Timeout = integer_to_binary(?LOCK_TIMEOUT_SECONDS),
-    Sql = <<"SELECT GET_LOCK('parrot:migrations', ", Timeout/binary, ")">>,
-    case mysql:query(Connection, Sql, lock_query_timeout()) of
+    lock(Connection, parrot_driver:lock_options([])).
+
+unlock(Connection) ->
+    unlock(Connection, parrot_driver:lock_options([])).
+
+lock(Connection, #{key := Key} = LockOptions) ->
+    case mysql:query(Connection, ?LOCK_MIGRATIONS, [Key, 0]) of
         {ok, _Columns, [[1]]} ->
             ok;
+        {ok, _Columns, [[0]]} ->
+            wait_lock(Connection, LockOptions);
         {ok, _Columns, Rows} ->
             {error, {lock_not_acquired, Rows}};
         {error, Reason} ->
             {error, Reason}
     end.
 
-unlock(Connection) ->
-    catch mysql:query(Connection, ?UNLOCK_MIGRATIONS),
+unlock(Connection, #{key := Key}) ->
+    catch mysql:query(Connection, ?UNLOCK_MIGRATIONS, [Key]),
     ok.
+
+wait_lock(_Connection, #{key := Key, timeout := 0}) ->
+    {error, {lock_timeout, Key, 0}};
+wait_lock(Connection, #{key := Key, timeout := Timeout} = LockOptions) ->
+    ok = parrot_driver:log_lock_wait(LockOptions),
+    Seconds = lock_timeout_seconds(Timeout),
+    case mysql:query(Connection, ?LOCK_MIGRATIONS, [Key, Seconds], lock_query_timeout(Seconds)) of
+        {ok, _Columns, [[1]]} ->
+            ok;
+        {ok, _Columns, [[0]]} ->
+            {error, {lock_timeout, Key, Timeout}};
+        {ok, _Columns, Rows} ->
+            {error, {lock_not_acquired, Rows}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+lock_timeout_seconds(infinity) ->
+    ?INFINITE_LOCK_TIMEOUT_SECONDS;
+lock_timeout_seconds(Milliseconds) ->
+    (Milliseconds + 999) div 1000.
 
 begin_tx(Connection) ->
     exec_sql(Connection, <<"BEGIN">>).
@@ -151,9 +205,9 @@ exec_sql(Connection, Sql) ->
             ok
     end.
 
-lock_query_timeout() ->
+lock_query_timeout(Seconds) ->
     %% Give the client a margin above the server-side lock timeout.
-    timer:seconds(?LOCK_TIMEOUT_SECONDS + 60).
+    timer:seconds(Seconds + 60).
 
 boolean_to_integer(true) ->
     1;
